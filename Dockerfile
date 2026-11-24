@@ -17,6 +17,9 @@ VOLUME ["/data"]
 
 EXPOSE 8000
 
-# single worker: SQLite file + in-process state stay consistent; threads are
-# safe because every request opens its own sqlite3 connection
-CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "1", "--threads", "4", "--timeout", "120", "wsgi:app"]
+# Two worker processes so a long incremental upload (CPU-bound weight
+# generation) cannot block queries/corrections in the other worker.  SQLite
+# consistency is kept by WAL + BEGIN IMMEDIATE transactions and the
+# generation/fingerprint baseline check, which also covers cross-worker
+# upload races.
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", "--threads", "4", "--timeout", "600", "wsgi:app"]

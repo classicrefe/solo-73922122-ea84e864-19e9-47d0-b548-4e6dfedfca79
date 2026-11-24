@@ -54,13 +54,30 @@
 
   <section class="card">
     <h2>1. 上传原表 CSV</h2>
-    <p class="muted">要求：UTF-8 文本，每行两列 <code>住户号,评分</code>，住户号唯一，评分为 0～10 的整数；首行可以是表头。原表入库后原样保留，更正表自动初始化为相同副本。重新上传会整体替换数据集。</p>
+    <p class="muted">要求：UTF-8 文本，每行两列 <code>住户号,评分</code>，住户号唯一，评分为 0～10 的整数；首行可以是表头。原表入库后原样保留，更正表自动初始化为相同副本。
+      重传时以当前已提交的原表为基准，只为<strong>新增、移除或评分有变</strong>的住户生成抽样权重；仅调整行序不会生成任何权重。首次上传则全量计算。</p>
     <form method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data">
+      {# blank database -> generation 0; two tabs from a blank page still conflict #}
+      <input type="hidden" name="base_generation" value="{{ upload_status.generation if upload_status else 0 }}">
+      <input type="hidden" name="base_fingerprint" value="{{ upload_status.fingerprint if upload_status else '' }}">
       <div class="row">
         <input type="file" name="csv_file" accept=".csv,text/csv" required>
+        <label class="muted" style="display:flex; align-items:center; gap:6px;">
+          <input type="checkbox" name="force_full" value="1" style="min-width:auto; width:auto;"> 强制全量重算（维护用）
+        </label>
         <button type="submit">上传并入库</button>
       </div>
     </form>
+    <p class="muted">从打开本页到提交期间，若有另一笔原表上传先入库，本次会自动退回并提示重新上传（即使内容相同）。上传计算期间仍可查询与按户更正。</p>
+    {% if upload_status %}
+    <table style="max-width:720px; margin-top:10px;">
+      <tr><th>本次上传方式</th><td>
+        {% if upload_status.last_mode == 'incremental' %}增量（仅变更户）{% elif upload_status.last_mode == 'full' %}全量{% else %}历史数据（下次重传起启用增量）{% endif %}
+      </td></tr>
+      <tr><th>本次生成权重的户数</th><td class="num">{{ upload_status.last_recomputed_count if upload_status.last_recomputed_count is not none else '—' }} 户</td></tr>
+      <tr><th>当前原表户数 / 上传时间</th><td class="num">{{ upload_status.orig_n }} 户 / {{ upload_status.last_upload_at or '—' }}</td></tr>
+    </table>
+    {% endif %}
   </section>
 
   {% if uploaded %}
@@ -98,6 +115,7 @@
     <form method="post" action="{{ url_for('reset') }}" style="margin-top:14px;">
       <button type="submit" class="danger">重置更正表为原表</button>
     </form>
+    <p class="muted" style="margin-top:12px;">上传新原表时，原表、更正表（从新原表重新初始化）与轮次汇总在同一事务内一起生效。上传生成权重期间本页的查询与按户更正照常可用；若另一笔原表上传在本次取基准之后先入库，本次会整体退回并提示重新上传。</p>
   </section>
 
   <section class="card">

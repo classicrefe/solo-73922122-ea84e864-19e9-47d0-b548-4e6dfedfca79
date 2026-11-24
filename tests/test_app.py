@@ -16,11 +16,16 @@ from app.db import (  # noqa: E402
     META_CORR_SUM,
     META_ORIG_N,
     META_ORIG_SUM,
+    UploadConflict,
     apply_correction,
+    build_upload_plan,
     connect,
     get_household,
+    get_upload_status,
     init_db,
+    load_upload_baseline,
     replace_original,
+    reupload_original,
     reset_corrected,
 )
 from app.stats import analyze  # noqa: E402
@@ -318,3 +323,435 @@ class FlaskFlowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class IncrementalUploadTests(unittest.TestCase):
+    """Re-upload only generates weights for added/removed/score-changed rows."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.tmp.name, "inc.db")
+        self.conn = connect(self.db_path)
+        init_db(self.conn)
+        self.rows = [(f"H{i:03d}", (i * 5) % 11) for i in range(60)]
+        self.first = replace_original(self.conn, self.rows, "t0")
+        self.assertEqual(self.first["recomputed_count"], 60)
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def _summaries(self):
+        return {
+            (r["round_index"]): (r["weight_total"], r["weighted_sum"])
+            for r in self.conn.execute(
+                "SELECT round_index, weight_total, weighted_sum FROM orig_rounds"
+            )
+        }
+
+    def _reupload(self, new_rows, base=None):
+        if base is None:
+            base = load_upload_baseline(self.conn)
+        plan = build_upload_plan(new_rows, base["rows"])
+        outcome = reupload_original(
+            self.conn, new_rows, "t1",
+            base["fingerprint"], base["generation"], plan,
+        )
+        return plan, outcome
+
+    def test_only_changed_households_recomputed_and_sums_match_full(self):
+        new_rows = [tuple(r) for r in self.rows]
+        new_rows[3] = (new_rows[3][0], (new_rows[3][1] + 1) % 11)  # score change
+        new_rows[10] = (new_rows[10][0], new_rows[10][1])           # unchanged
+        new_rows.append(("NEW-1", 8))                                # added
+        new_rows = [r for r in new_rows if r[0] != "H020"]           # removed
+        plan, outcome = self._reupload(new_rows)
+        self.assertEqual(plan["changed_count"], 3)
+        self.assertEqual(outcome["recomputed_count"], 3)
+        self.assertEqual(outcome["mode"], "incremental")
+        self.assertEqual(analyze(self.conn)["orig_n"], len(new_rows))
+        # corrected table re-initialised from the new original
+        self.assertEqual(
+            [(r["household_id"], r["score"]) for r in self.conn.execute(
+                "SELECT household_id, score FROM corrected_scores ORDER BY household_id")],
+            sorted(new_rows),
+        )
+        incremental = self._summaries()
+        corr = {r["round_index"]: (r["weight_total"], r["weighted_sum"])
+                for r in self.conn.execute(
+                    "SELECT round_index, weight_total, weighted_sum FROM corr_rounds")}
+        self.assertEqual(incremental, corr)
+        # full recomputation in a fresh database must match bit for bit
+        tmp2 = tempfile.TemporaryDirectory()
+        conn2 = connect(os.path.join(tmp2.name, "full.db"))
+        init_db(conn2)
+        replace_original(conn2, new_rows, "t1")
+        full = {(r["round_index"]): (r["weight_total"], r["weighted_sum"])
+                for r in conn2.execute(
+                    "SELECT round_index, weight_total, weighted_sum FROM orig_rounds")}
+        self.assertEqual(incremental, full)
+        conn2.close()
+        tmp2.cleanup()
+
+    def test_reorder_only_generates_zero_household_weights(self):
+        before = self._summaries()
+        reordered = list(reversed(self.rows))
+        import app.db as db_mod
+        real = db_mod.household_weights
+        calls = []
+
+        def counting(hid, *a, **kw):
+            calls.append(hid)
+            return real(hid, *a, **kw)
+
+        db_mod.household_weights = counting
+        try:
+            plan, outcome = self._reupload(reordered)
+        finally:
+            db_mod.household_weights = real
+        self.assertEqual(plan["changed_count"], 0)
+        self.assertEqual(outcome["recomputed_count"], 0)
+        self.assertEqual(calls, [])
+        self.assertEqual(self._summaries(), before)
+
+    def test_conflict_on_stale_baseline_even_with_identical_content(self):
+        stale = load_upload_baseline(self.conn)
+        # another upload (any content, here identical) commits first
+        self._reupload([tuple(r) for r in self.rows])
+        snapshot = self._summaries()
+        plan = build_upload_plan([tuple(r) for r in self.rows], stale["rows"])
+        with self.assertRaises(UploadConflict):
+            reupload_original(
+                self.conn, [tuple(r) for r in self.rows], "t2",
+                stale["fingerprint"], stale["generation"], plan,
+            )
+        self.assertEqual(self._summaries(), snapshot)
+        self.assertEqual(analyze(self.conn)["orig_n"], len(self.rows))
+
+    def test_corrections_during_planning_commit_and_upload_still_applies(self):
+        base = load_upload_baseline(self.conn)
+        new_rows = [tuple(r) for r in self.rows]
+        new_rows[0] = (new_rows[0][0], 10)
+        plan = build_upload_plan(new_rows, base["rows"])  # long-running step
+        # a per-household correction lands while the plan is computed
+        apply_correction(self.conn, "H005", "update", 3)
+        self.assertEqual(get_household(self.conn, "H005")["corrected_score"], 3)
+        outcome = reupload_original(
+            self.conn, new_rows, "t1",
+            base["fingerprint"], base["generation"], plan,
+        )
+        self.assertEqual(outcome["recomputed_count"], 1)
+        # upload succeeded and the corrected table starts from the new original
+        self.assertEqual(analyze(self.conn)["corr_n"], len(new_rows))
+        # the in-flight correction is superseded: corrected copy == new original
+        self.assertEqual(
+            get_household(self.conn, "H005")["corrected_score"],
+            dict(new_rows)["H005"],
+        )
+        self.assertEqual(analyze(self.conn)["orig_n"], len(new_rows))
+
+    def test_failed_write_keeps_previous_data(self):
+        base = load_upload_baseline(self.conn)
+        new_rows = [("X", 1)]
+        plan = build_upload_plan(new_rows, base["rows"])
+        before = self._summaries()
+        # corrupt the summary count so the guarded write refuses to run
+        self.conn.execute("DELETE FROM orig_rounds WHERE round_index = 0")
+        self.conn.commit()
+        with self.assertRaises(RuntimeError):
+            reupload_original(
+                self.conn, new_rows, "t1",
+                base["fingerprint"], base["generation"], plan,
+            )
+        self.assertEqual(analyze(self.conn)["orig_n"], len(self.rows))
+        stored = [r["household_id"] for r in self.conn.execute(
+            "SELECT household_id FROM original_scores")]
+        self.assertEqual(len(stored), len(self.rows))
+
+    def test_legacy_database_is_upgraded_in_place(self):
+        # simulate a pre-incremental database: drop the new bookkeeping keys
+        for key in ("orig_fingerprint", "upload_generation", "last_recomputed_count",
+                    "last_upload_mode", "last_upload_at"):
+            self.conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+        self.conn.commit()
+        status = get_upload_status(self.conn)
+        self.assertIsNotNone(status["generation"])
+        self.assertEqual(status["orig_n"], len(self.rows))
+        new_rows = [tuple(r) for r in self.rows]
+        new_rows[0] = (new_rows[0][0], (new_rows[0][1] + 1) % 11)
+        plan, outcome = self._reupload(new_rows, load_upload_baseline(self.conn))
+        self.assertEqual(outcome["recomputed_count"], 1)
+        self.assertEqual(analyze(self.conn)["orig_n"], len(self.rows))
+
+
+class IncrementalFlaskTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.tmp.name, "web-inc.db")
+        self.app = create_app(db_path=self.db_path)
+        self.client = self.app.test_client()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _upload(self, rows, base=None):
+        data = {
+            "csv_file": (io.BytesIO(csv_bytes(rows, header=True)), "s.csv"),
+        }
+        if base is not None:
+            data["base_generation"] = str(base["generation"])
+            data["base_fingerprint"] = base["fingerprint"]
+        return self.client.post("/upload", data=data,
+                                content_type="multipart/form-data",
+                                follow_redirects=True)
+
+    def _page_baseline(self):
+        import re
+        body = self.client.get("/").get_data(as_text=True)
+        gen = re.search(r'name="base_generation" value="([^"]*)"', body)
+        fp = re.search(r'name="base_fingerprint" value="([^"]*)"', body)
+        return {"generation": int(gen.group(1) or 0), "fingerprint": fp.group(1)}
+
+    def test_web_shows_recomputed_count_and_incremental_flow(self):
+        rows = [(f"H{i:02d}", i % 11) for i in range(25)]
+        first = self._upload(rows)
+        body = first.get_data(as_text=True)
+        self.assertIn("首次上传成功", body)
+        self.assertIn("本次生成权重的户数", body)
+        self.assertIn("25 户", body)
+        self.assertIn("全量", body)
+
+        base = self._page_baseline()
+        changed = [tuple(r) for r in rows]
+        changed[2] = (changed[2][0], (changed[2][1] + 2) % 11)
+        changed.append(("H99", 7))
+        changed = [r for r in changed if r[0] != "H00"]
+        resp = self._upload(changed, base=base)
+        body = resp.get_data(as_text=True)
+        self.assertIn("上传成功", body)
+        self.assertIn("本次为 3 户生成抽样权重", body)
+        self.assertIn("增量（仅变更户）", body)
+        self.assertIn("3 户", body)
+
+    def test_stale_page_upload_is_returned_and_data_unchanged(self):
+        rows = [(f"H{i:02d}", i % 11) for i in range(10)]
+        self._upload(rows)
+        stale = self._page_baseline()
+        other = [tuple(r) for r in rows]
+        other[0] = (other[0][0], 9)
+        self._upload(other)  # another tab commits first
+        page = self.client.get("/").get_data(as_text=True)
+        self.assertIn("+", page)  # dataset still present
+        resp = self._upload([tuple(r) for r in rows], base=stale)
+        body = resp.get_data(as_text=True)
+        self.assertIn("本次上传已退回", body)
+        self.assertIn("请重新上传", body)
+        # current dataset is the other tab's, not the stale one
+        conn = connect(self.db_path)
+        try:
+            self.assertEqual(
+                conn.execute("SELECT score FROM original_scores WHERE household_id='H00'")
+                .fetchone()["score"], 9)
+        finally:
+            conn.close()
+        # retry with the freshly rendered baseline succeeds
+        retried = self._upload([tuple(r) for r in rows],
+                               base=self._page_baseline())
+        self.assertIn("上传成功", retried.get_data(as_text=True))
+
+    def test_reorder_upload_reports_zero_households(self):
+        rows = [(f"H{i:02d}", i % 11) for i in range(15)]
+        self._upload(rows)
+        resp = self._upload(list(reversed(rows)), base=self._page_baseline())
+        body = resp.get_data(as_text=True)
+        self.assertIn("本次为 0 户生成抽样权重", body)
+
+    def test_concurrent_correction_then_upload_applies(self):
+        rows = [(f"H{i:02d}", i % 11) for i in range(12)]
+        self._upload(rows)
+        base = self._page_baseline()
+        # a correction commits between page render and the upload
+        self.client.post("/correct", data={
+            "household_id": "H03", "action": "update", "score": "10",
+        }, follow_redirects=True)
+        changed = [tuple(r) for r in rows]
+        changed[0] = (changed[0][0], (changed[0][1] + 1) % 11)
+        resp = self._upload(changed, base=base)
+        body = resp.get_data(as_text=True)
+        self.assertIn("上传成功", body)
+        self.assertIn("本次为 1 户生成抽样权重", body)
+        # corrected table re-initialised from the new original (correction gone)
+        conn = connect(self.db_path)
+        try:
+            c = conn.execute(
+                "SELECT score FROM corrected_scores WHERE household_id='H03'"
+            ).fetchone()["score"]
+            self.assertEqual(c, changed[3][1])
+        finally:
+            conn.close()
+
+    def test_two_first_uploads_from_blank_page_only_one_wins(self):
+        rows = [(f"H{i:02d}", i % 11) for i in range(8)]
+        # both submissions were rendered while the database was still empty
+        blank = {"generation": 0, "fingerprint": ""}
+        first = self._upload(rows, base=blank)
+        self.assertIn("首次上传成功", first.get_data(as_text=True))
+        second = self._upload([("X", 5)], base=blank)
+        body = second.get_data(as_text=True)
+        self.assertIn("本次上传已退回", body)
+        conn = connect(self.db_path)
+        try:
+            ids = [r["household_id"] for r in conn.execute(
+                "SELECT household_id FROM original_scores ORDER BY household_id")]
+            self.assertEqual(ids, [h for h, _ in rows])
+        finally:
+            conn.close()
+
+    def test_validation_failure_leaves_current_data(self):
+        rows = [(f"H{i:02d}", i % 11) for i in range(8)]
+        self._upload(rows)
+        base = self._page_baseline()
+        resp = self.client.post("/upload", data={
+            "base_generation": str(base["generation"]),
+            "base_fingerprint": base["fingerprint"],
+            "csv_file": (io.BytesIO(b"id,score\nH00,99"), "bad.csv"),
+        }, content_type="multipart/form-data", follow_redirects=True)
+        body = resp.get_data(as_text=True)
+        self.assertIn("上传被拒绝", body)
+        self.assertIn("8 户", body)
+
+    def test_force_full_matches_incremental_and_is_marked_full(self):
+        rows = [(f"H{i:02d}", i % 11) for i in range(30)]
+        self._upload(rows)
+        base = self._page_baseline()
+        changed = [tuple(r) for r in rows]
+        changed[0] = (changed[0][0], 10)
+        # incremental first
+        inc = self._upload(changed, base=base)
+        inc_summary = self._summary_snapshot()
+        self.assertIn("本次为 1 户生成抽样权重", inc.get_data(as_text=True))
+        self.assertIn("增量（仅变更户）", inc.get_data(as_text=True))
+        # then force a full recompute of the same content
+        base2 = self._page_baseline()
+        data = {
+            "csv_file": (io.BytesIO(csv_bytes(changed)), "s.csv"),
+            "base_generation": str(base2["generation"]),
+            "base_fingerprint": base2["fingerprint"],
+            "force_full": "1",
+        }
+        resp = self.client.post("/upload", data=data,
+                                content_type="multipart/form-data",
+                                follow_redirects=True)
+        body = resp.get_data(as_text=True)
+        self.assertIn("全量重算成功", body)
+        self.assertIn("本次为全部 30 户生成抽样权重", body)
+        self.assertEqual(self._summary_snapshot(), inc_summary)
+
+    def test_chained_incremental_equals_full_recompute(self):
+        import app.db as m
+        rows = [(f"K{i:03d}", i % 11) for i in range(50)]
+        self._upload(rows)
+        for step in range(3):
+            base = self._page_baseline()
+            rows = [tuple(r) for r in rows]
+            rows[step * 5] = (rows[step * 5][0], (rows[step * 5][1] + 4) % 11)
+            rows.append((f"NEW{step}", step + 1))
+            rows = [r for r in rows if r[0] != f"K{step:03d}"]
+            self._upload(rows, base=base)
+        inc = self._summary_snapshot()
+        tmp = tempfile.TemporaryDirectory()
+        conn = connect(os.path.join(tmp.name, "f.db"))
+        init_db(conn)
+        replace_original(conn, rows, "t")
+        full = {(r["round_index"]): (r["weight_total"], r["weighted_sum"])
+                for r in conn.execute(
+                    "SELECT round_index, weight_total, weighted_sum FROM orig_rounds")}
+        conn.close()
+        tmp.cleanup()
+        self.assertEqual(inc, full)
+
+    def _summary_snapshot(self):
+        conn = connect(self.db_path)
+        try:
+            return {(r["round_index"]): (r["weight_total"], r["weighted_sum"])
+                    for r in conn.execute(
+                        "SELECT round_index, weight_total, weighted_sum FROM orig_rounds")}
+        finally:
+            conn.close()
+
+    def test_exception_during_write_rolls_back_and_keeps_current_data(self):
+        import app.db as m
+        rows = [(f"H{i:02d}", i % 11) for i in range(12)]
+        self._upload(rows)
+        snapshot = self._summary_snapshot()
+        conn_snapshot = connect(self.db_path)
+        try:
+            orig_before = sorted((r["household_id"], r["score"]) for r in conn_snapshot.execute(
+                "SELECT household_id, score FROM original_scores"))
+        finally:
+            conn_snapshot.close()
+        base = load_upload_baseline(connect(self.db_path))
+        conn = connect(self.db_path)
+        try:
+            new_rows = [("Z", 4)]
+            plan = build_upload_plan(new_rows, base["rows"])
+            real = m._write_dataset
+            def boom(*a, **kw):
+                real(*a, **kw)      # write, then fail before COMMIT
+                raise RuntimeError("simulated disk error")
+            m._write_dataset = boom
+            try:
+                with self.assertRaises(RuntimeError):
+                    reupload_original(conn, new_rows, "t",
+                                      base["fingerprint"], base["generation"], plan)
+            finally:
+                m._write_dataset = real
+            self.assertFalse(conn.in_transaction)
+            self.assertEqual(
+                sorted((r["household_id"], r["score"]) for r in conn.execute(
+                    "SELECT household_id, score FROM original_scores")),
+                orig_before)
+        finally:
+            conn.close()
+        self.assertEqual(self._summary_snapshot(), snapshot)
+
+    def test_inconsistent_summary_is_refused_until_forced_full(self):
+        rows = [(f"H{i:02d}", i % 11) for i in range(10)]
+        self._upload(rows)
+        base = self._page_baseline()
+        conn = connect(self.db_path)
+        try:
+            conn.execute(
+                "UPDATE orig_rounds SET weighted_sum = weighted_sum + 7 "
+                "WHERE round_index = 5")
+            conn.commit()
+        finally:
+            conn.close()
+        changed = [tuple(r) for r in rows]
+        changed[0] = (changed[0][0], 10)
+        resp = self._upload(changed, base=base)
+        body = resp.get_data(as_text=True)
+        self.assertIn("入库失败", body)
+        self.assertIn("强制全量重算", body)
+        # force full repairs and reproduces the correct summary
+        base2 = self._page_baseline()
+        data = {
+            "csv_file": (io.BytesIO(csv_bytes(changed)), "s.csv"),
+            "base_generation": str(base2["generation"]),
+            "base_fingerprint": base2["fingerprint"],
+            "force_full": "1",
+        }
+        resp2 = self.client.post("/upload", data=data,
+                                 content_type="multipart/form-data",
+                                 follow_redirects=True)
+        self.assertIn("全量重算成功", resp2.get_data(as_text=True))
+        tmp = tempfile.TemporaryDirectory()
+        conn = connect(os.path.join(tmp.name, "ref.db"))
+        init_db(conn)
+        replace_original(conn, changed, "t")
+        expected = {(r["round_index"]): (r["weight_total"], r["weighted_sum"])
+                    for r in conn.execute(
+                        "SELECT round_index, weight_total, weighted_sum FROM orig_rounds")}
+        conn.close()
+        tmp.cleanup()
+        self.assertEqual(self._summary_snapshot(), expected)
