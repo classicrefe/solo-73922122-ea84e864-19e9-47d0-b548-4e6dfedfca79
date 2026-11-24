@@ -1,0 +1,21 @@
+services:
+  review:
+    build: .
+    image: bus-survey-review:latest
+    container_name: bus-survey-review
+    ports:
+      - "8000:8000"
+    volumes:
+      - survey-data:/data
+    environment:
+      DB_PATH: /data/survey.db
+      SECRET_KEY: change-me-in-production
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  survey-data:

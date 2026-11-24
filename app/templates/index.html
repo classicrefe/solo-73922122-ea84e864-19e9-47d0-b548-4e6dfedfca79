@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>公交接驳满意度 · 更正复核页</title>
+<style>
+  :root { --line:#d7dde5; --bg:#f5f7fa; --brand:#1f5fa8; --ok:#1a7f4b; --err:#b42318; --warn:#9a6700; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: "Noto Sans CJK SC","PingFang SC","Microsoft YaHei",sans-serif;
+         background:var(--bg); color:#1c2733; line-height:1.55; }
+  header { background:var(--brand); color:#fff; padding:18px 28px; }
+  header h1 { margin:0; font-size:20px; }
+  header p { margin:4px 0 0; font-size:13px; opacity:.85; }
+  main { max-width:1080px; margin:24px auto; padding:0 20px; display:grid; gap:18px; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:10px; padding:20px 22px; }
+  .card h2 { margin:0 0 12px; font-size:16px; color:var(--brand); }
+  .muted { color:#5b6b7c; font-size:13px; }
+  form .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:10px; }
+  input[type=text], input[type=number], select {
+    padding:8px 10px; border:1px solid var(--line); border-radius:6px; font-size:14px; min-width:140px; }
+  button { padding:8px 16px; border:0; border-radius:6px; background:var(--brand); color:#fff;
+           font-size:14px; cursor:pointer; }
+  button.secondary { background:#5b6b7c; }
+  button.danger { background:var(--err); }
+  button:hover { opacity:.9; }
+  table { border-collapse:collapse; width:100%; font-size:14px; }
+  th, td { border:1px solid var(--line); padding:8px 10px; text-align:left; }
+  th { background:#eef2f7; font-weight:600; }
+  td.num { text-align:right; font-variant-numeric: tabular-nums; }
+  .flash { padding:10px 14px; border-radius:8px; margin-bottom:12px; font-size:14px; }
+  .flash.ok { background:#e8f5ee; color:var(--ok); border:1px solid #b7dfc8; }
+  .flash.error { background:#fdecea; color:var(--err); border:1px solid #f3c2bd; }
+  .flash.warn { background:#fff6e0; color:var(--warn); border:1px solid #ecd9a8; }
+  .badge { display:inline-block; padding:2px 9px; border-radius:999px; font-size:12px; }
+  .badge.ok { background:#e8f5ee; color:var(--ok); }
+  .badge.bad { background:#fdecea; color:var(--err); }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+  @media (max-width: 760px) { .grid2 { grid-template-columns:1fr; } }
+  code { background:#f0f2f5; padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>公交接驳满意度调查 · 两版均分差值复核</h1>
+  <p>固定种子 1000 轮泊松自助（每户每轮独立 Pois(1) 权重，两表同户共用权重）· 更正表与汇总同事务生效</p>
+</header>
+<main>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, msg in messages %}
+      <div class="flash {{ category }}">{{ msg }}</div>
+    {% endfor %}
+  {% endwith %}
+
+  <section class="card">
+    <h2>1. 上传原表 CSV</h2>
+    <p class="muted">要求：UTF-8 文本，每行两列 <code>住户号,评分</code>，住户号唯一，评分为 0～10 的整数；首行可以是表头。原表入库后原样保留，更正表自动初始化为相同副本。重新上传会整体替换数据集。</p>
+    <form method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data">
+      <div class="row">
+        <input type="file" name="csv_file" accept=".csv,text/csv" required>
+        <button type="submit">上传并入库</button>
+      </div>
+    </form>
+  </section>
+
+  {% if uploaded %}
+  <section class="card">
+    <h2>2. 按户更正（补录 / 改分 / 移除）</h2>
+    <p class="muted">每次只重算该户在 1000 轮中的贡献，其他户的权重与明细均不读取、不受影响；更正表与轮次汇总在同一事务提交，失败自动回滚并保留上一结果。</p>
+    <form method="post" action="{{ url_for('correct') }}">
+      <div class="row">
+        <input type="text" name="household_id" placeholder="住户号" required>
+        <select name="action">
+          <option value="update">改分</option>
+          <option value="add">补录新增户</option>
+          <option value="remove">移除该户</option>
+        </select>
+        <input type="number" name="score" placeholder="新评分 0～10" min="0" max="10" step="1">
+        <button type="submit">提交更正</button>
+      </div>
+    </form>
+    <form method="get" action="{{ url_for('index') }}">
+      <div class="row">
+        <input type="text" name="household_id" placeholder="查询单户两版评分" value="{{ lookup_id }}">
+        <button type="submit" class="secondary">查询该户</button>
+      </div>
+    </form>
+    {% if lookup %}
+    <table style="max-width:560px; margin-top:8px;">
+      <tr><th>住户号</th><th>原表评分</th><th>更正表评分</th></tr>
+      <tr>
+        <td>{{ lookup.household_id }}</td>
+        <td class="num">{{ lookup.original_score if lookup.original_score is not none else '—（原表无此户）' }}</td>
+        <td class="num">{{ lookup.corrected_score if lookup.corrected_score is not none else '—（已移除）' }}</td>
+      </tr>
+    </table>
+    {% endif %}
+    <form method="post" action="{{ url_for('reset') }}" style="margin-top:14px;">
+      <button type="submit" class="danger">重置更正表为原表</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>3. 估计结果（查询只读汇总表，不读取住户明细）</h2>
+    {% if result.status == 'undefined' %}
+      <p><span class="badge bad">无法计算</span> {{ result.reason }}</p>
+      <table>
+        <tr><th>指标</th><th>数值</th></tr>
+        <tr><td>原表户数 / 均分</td><td class="num">{{ result.orig_n }} 户 /
+          {% if result.orig_mean is not none %}{{ '%.4f'|format(result.orig_mean) }}{% else %}—{% endif %}</td></tr>
+        <tr><td>更正表户数 / 均分</td><td class="num">{{ result.corr_n }} 户 /
+          {% if result.corr_mean is not none %}{{ '%.4f'|format(result.corr_mean) }}{% else %}—{% endif %}</td></tr>
+        <tr><td>未加权均分差（更正 − 原）</td><td class="num">
+          {% if result.unweighted_diff is not none %}{{ '%.4f'|format(result.unweighted_diff) }}{% else %}—{% endif %}</td></tr>
+        <tr><td>有效轮数</td><td class="num">{{ result.valid_rounds }} / {{ result.rounds_total }}（跳过 {{ result.skipped_rounds }} 轮）</td></tr>
+        <tr><td>轮差值 2.5% / 97.5% 分位</td><td class="num">— / —</td></tr>
+      </table>
+    {% else %}
+    <table>
+      <tr><th>指标</th><th>数值</th><th>说明</th></tr>
+      <tr><td>原表户数 / 未加权均分</td><td class="num">{{ result.orig_n }} 户 / {{ '%.4f'|format(result.orig_mean) }}</td><td class="muted">入库后原样保留</td></tr>
+      <tr><td>更正表户数 / 未加权均分</td><td class="num">{{ result.corr_n }} 户 / {{ '%.4f'|format(result.corr_mean) }}</td><td class="muted">当前更正结果</td></tr>
+      <tr><td><b>未加权均分差（更正 − 原）</b></td><td class="num"><b>{{ '%+.4f'|format(result.unweighted_diff) }}</b></td><td class="muted">点估计，未使用自助权重</td></tr>
+      <tr><td>有效轮数</td><td class="num">{{ result.valid_rounds }} / {{ result.rounds_total }}</td><td class="muted">跳过 {{ result.skipped_rounds }} 轮（任一侧权重合计为 0）</td></tr>
+      <tr><td><b>轮差值 2.5% 分位</b></td><td class="num"><b>{{ '%+.4f'|format(result.p025) }}</b></td><td class="muted">每轮：更正加权均分 − 原表加权均分</td></tr>
+      <tr><td><b>轮差值 97.5% 分位</b></td><td class="num"><b>{{ '%+.4f'|format(result.p975) }}</b></td><td class="muted">线性插值（type-7）</td></tr>
+    </table>
+    {% endif %}
+  </section>
+  {% else %}
+  <section class="card">
+    <h2>2. 估计结果</h2>
+    <p><span class="badge bad">无法计算</span> 尚未上传原表 CSV，请先完成上传。</p>
+  </section>
+  {% endif %}
+</main>
+</body>
+</html>
